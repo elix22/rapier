@@ -1,0 +1,4 @@
+# Build output only. Cargo.lock IS committed (this is a top-level buildable staticlib —
+# committing the lock pins rapier3d + nalgebra + all transitive versions so the CI-built
+# library is byte-reproducible).
+/target

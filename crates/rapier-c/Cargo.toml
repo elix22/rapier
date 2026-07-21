@@ -1,0 +1,40 @@
+# rapier-c — a C ABI (`librapier_c.a` + include/rapier_c.h) over the native Rust
+# `rapier3d` solver, for the threejs-native-runtime. See include/rapier_c.h for the
+# contract and phase19-native-rapier-plan.md for why this exists (armv7 Redmi: native
+# ARM code has none of the WAMR-AOT 32-bit alignment fragility).
+[package]
+name = "rapier-c"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Stable C ABI over native rapier3d (f32) for threejs-native-runtime"
+license = "Apache-2.0"
+repository = "https://github.com/elix22/rapier"
+
+# Own, empty workspace table: makes this crate its OWN workspace root so `cargo` here
+# never tries to join the parent rapier workspace. That keeps upstream rapier files
+# untouched (minimal fork merge surface) and gives us an isolated Cargo.lock + target/.
+[workspace]
+
+[lib]
+name = "rapier_c"
+crate-type = ["staticlib"]
+
+[dependencies]
+# Pinned to the exact latest crates.io release (f32, 3D). We do NOT path-depend on the
+# in-tree rapier3d so the built lib is reproducible from crates.io regardless of what the
+# fork's master drifts to. Web stays on npm compat 0.19.3 (its separate track); the shim
+# + tolerant gates bridge the version gap (plan §L1).
+rapier3d = "=0.34.0"
+
+# Release: fast + small, single codegen unit for LTO. panic = "abort" so a Rust panic can
+# never unwind across the extern "C" boundary into the host (that would be UB) — it
+# aborts the process instead, which the gates treat as a hard failure.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
