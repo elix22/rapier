@@ -134,6 +134,9 @@ void rpr_body_set_translation(RprWorld* w, uint64_t body, const float v[3], int3
 void rpr_body_set_rotation(RprWorld* w, uint64_t body, const float q[4], int32_t wake);
 void rpr_body_set_linvel(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
 void rpr_body_set_angvel(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
+/* Kinematic-position bodies: the pose to interpolate to on the next step (compat
+ * setNextKinematicTranslation). */
+void rpr_body_set_next_kinematic_translation(RprWorld* w, uint64_t body, const float v[3]);
 
 /* ---- colliders ------------------------------------------------------------------- */
 
@@ -191,6 +194,14 @@ void rpr_char_set_up(RprWorld* w, uint64_t cc, const float up[3]);
  * the result is stashed and read back with rpr_char_computed_movement. */
 void rpr_char_compute_movement(RprWorld* w, uint64_t cc, uint64_t collider, const float desired[3]);
 void rpr_char_computed_movement(RprWorld* w, uint64_t cc, float out[3]);
+/* Whether the last computed movement ended grounded (compat computedGrounded()). */
+int32_t rpr_char_computed_grounded(const RprWorld* w, uint64_t cc);
+void rpr_char_set_max_slope_climb_angle(RprWorld* w, uint64_t cc, float angle);   /* radians */
+void rpr_char_set_min_slope_slide_angle(RprWorld* w, uint64_t cc, float angle);   /* radians */
+/* Enable auto-stepping over small ledges (heights/widths are absolute world units). */
+void rpr_char_enable_autostep(RprWorld* w, uint64_t cc, float max_height, float min_width, int32_t include_dynamic);
+/* Enable snap-to-ground within `dist` (absolute world units). */
+void rpr_char_enable_snap_to_ground(RprWorld* w, uint64_t cc, float dist);
 
 #ifdef __cplusplus
 }

@@ -29,8 +29,8 @@
 
 use core::ffi::c_char;
 use rapier3d::control::{
-    CharacterLength, DynamicRayCastVehicleController, KinematicCharacterController, Wheel,
-    WheelTuning,
+    CharacterAutostep, CharacterLength, DynamicRayCastVehicleController,
+    KinematicCharacterController, Wheel, WheelTuning,
 };
 use rapier3d::prelude::*;
 
@@ -48,6 +48,7 @@ const RPR_INVALID: u64 = u64::MAX;
 struct CharState {
     controller: KinematicCharacterController,
     last: Vector,
+    grounded: bool,
 }
 
 /// Everything one compat `World` owns. Kept behind a `Box`; the C side sees `RprWorld*`.
@@ -561,6 +562,7 @@ pub unsafe extern "C" fn rpr_world_create_character_controller(w: *mut RprWorld,
     rw.characters.push(CharState {
         controller,
         last: Vector::new(0.0, 0.0, 0.0),
+        grounded: false,
     });
     rw.characters.len() as u64 // 1-based
 }
@@ -596,7 +598,10 @@ pub unsafe extern "C" fn rpr_char_compute_movement(
         Some(c) => c,
         None => return,
     };
-    let qp = world.query_pipeline_with_filter(QueryFilter::default());
+    // Exclude the character's OWN collider from the query — otherwise move_shape sees the
+    // shape overlapping itself and blocks the movement. This is exactly what the collider
+    // handle is for in compat's computeColliderMovement(collider, ...).
+    let qp = world.query_pipeline_with_filter(QueryFilter::default().exclude_collider(coll_h));
     let result = cs.controller.move_shape(
         world.integration_parameters.dt,
         &qp,
@@ -606,6 +611,7 @@ pub unsafe extern "C" fn rpr_char_compute_movement(
         |_| {},
     );
     cs.last = result.translation;
+    cs.grounded = result.grounded;
 }
 
 #[no_mangle]
@@ -614,5 +620,66 @@ pub unsafe extern "C" fn rpr_char_computed_movement(w: *mut RprWorld, cc: u64, o
     let idx = (cc as usize).wrapping_sub(1);
     if let Some(c) = rw.characters.get(idx) {
         wr3(out, c.last);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_char_computed_grounded(w: *const RprWorld, cc: u64) -> i32 {
+    let rw = &*w;
+    let idx = (cc as usize).wrapping_sub(1);
+    rw.characters.get(idx).map(|c| c.grounded as i32).unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_char_set_max_slope_climb_angle(w: *mut RprWorld, cc: u64, angle: f32) {
+    let rw = &mut *w;
+    let idx = (cc as usize).wrapping_sub(1);
+    if let Some(c) = rw.characters.get_mut(idx) {
+        c.controller.max_slope_climb_angle = angle;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_char_set_min_slope_slide_angle(w: *mut RprWorld, cc: u64, angle: f32) {
+    let rw = &mut *w;
+    let idx = (cc as usize).wrapping_sub(1);
+    if let Some(c) = rw.characters.get_mut(idx) {
+        c.controller.min_slope_slide_angle = angle;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_char_enable_autostep(
+    w: *mut RprWorld,
+    cc: u64,
+    max_height: f32,
+    min_width: f32,
+    include_dynamic: i32,
+) {
+    let rw = &mut *w;
+    let idx = (cc as usize).wrapping_sub(1);
+    if let Some(c) = rw.characters.get_mut(idx) {
+        c.controller.autostep = Some(CharacterAutostep {
+            max_height: CharacterLength::Absolute(max_height),
+            min_width: CharacterLength::Absolute(min_width),
+            include_dynamic_bodies: include_dynamic != 0,
+        });
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_char_enable_snap_to_ground(w: *mut RprWorld, cc: u64, dist: f32) {
+    let rw = &mut *w;
+    let idx = (cc as usize).wrapping_sub(1);
+    if let Some(c) = rw.characters.get_mut(idx) {
+        c.controller.snap_to_ground = Some(CharacterLength::Absolute(dist));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_next_kinematic_translation(w: *mut RprWorld, body: u64, v: *const f32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_next_kinematic_translation(rd3(v));
     }
 }
