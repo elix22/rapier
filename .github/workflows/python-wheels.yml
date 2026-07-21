@@ -15,15 +15,11 @@ name: Python wheels
 # mainstream platforms; source builds use a full git checkout of the repo.
 # Restoring an sdist is tracked as a follow-up (needs an upstream layout
 # change or registry-based engine deps).
+# elix22 fork: upstream Rapier's stock CI is DISABLED (workflow_dispatch only) so it never
+# burns Actions minutes on pushes to this fork. The fork exists to build librapier_c for
+# threejs-native-runtime (.github/workflows/build-rapier-c.yml), not to publish Rapier's
+# Python wheels. Re-enable a push/tag trigger only to deliberately build wheels.
 on:
-  push:
-    branches: [master]
-    tags: ["python-v*"]
-  pull_request:
-    branches: [master]
-    paths:
-      - "python/**"
-      - ".github/workflows/python-wheels.yml"
   workflow_dispatch:
 
 permissions:

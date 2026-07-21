@@ -1,10 +1,10 @@
 name: Rapier CI bench
 
+# elix22 fork: upstream Rapier's stock CI is DISABLED (workflow_dispatch only) so it never
+# burns Actions minutes on pushes to this fork. The fork exists to build librapier_c for
+# threejs-native-runtime (.github/workflows/build-rapier-c.yml), not to run Rapier's bench
+# bot. Re-enable push/pull_request_target only to deliberately run the benchmark.
 on:
-  push:
-    branches: [ master ]
-  pull_request_target:
-    branches: [ master ]
   workflow_dispatch:
 
 jobs:

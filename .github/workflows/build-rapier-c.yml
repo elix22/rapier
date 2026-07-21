@@ -1,0 +1,105 @@
+# Build librapier_c prebuilt static libraries for the threejs-native-runtime SDK (Phase 19 P19.3).
+#
+# rapier-c (crates/rapier-c) is a stable C ABI over the native Rust `rapier3d` 0.34 solver.
+# The runtime links it in place of running Rapier's WebAssembly under WAMR — native ARM code
+# has none of the armv7 WAMR-AOT alignment fragility that made the wasm path a dead end on the
+# low-tier Redmi 6A (see the runtime's phase19-native-rapier-plan.md).
+#
+# This workflow cross-compiles the STATICLIB for every runtime platform and publishes each as a
+# permanent GitHub RELEASE asset (tag prebuilt-<short-sha>). The consuming runtime pins each
+# asset's sha256 in libs.lock.json and fetches it with tools/fetch-libs.mjs — never compiling
+# Rapier on the app-build hot path. Releases are permanent; the 90-day upload-artifact copies
+# are a convenience only.
+#
+# rapier-c is pure Rust (its committed Cargo.lock has no -sys/cc deps) and builds as a
+# `staticlib`, so rustc emits the archive with its own writer and never invokes a platform
+# linker: every target needs only `rustup target add <triple>` — no NDK, no iOS SDK sysroot.
+# The per-target `native-static-libs` line each build captures into MANIFEST.txt is what the
+# runtime's non-macOS link step (Android/Linux) must add (e.g. armv7 needs -llog -lunwind).
+name: Build librapier_c
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/rapier-c/**'
+      - '.github/workflows/build-rapier-c.yml'
+
+permissions:
+  contents: write   # gh release create/upload
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos,   runner: macos-latest,   script: build-macos.sh,   asset: rapier-macos-universal-Release.tar.gz }
+          - { name: ios,     runner: macos-latest,   script: build-ios.sh,     asset: rapier-ios-static-Release.tar.gz }
+          - { name: android, runner: ubuntu-latest,  script: build-android.sh, asset: rapier-android-Release.tar.gz }
+          - { name: linux,   runner: ubuntu-latest,  script: build-linux.sh,   asset: rapier-linux-x64-Release.tar.gz }
+          - { name: windows, runner: windows-latest, script: build-windows.sh, asset: rapier-windows-x64-Release.tar.gz }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash   # build-windows.sh runs under git-bash on windows-latest
+    steps:
+      - name: Checkout (the commit being built)
+        uses: actions/checkout@v4
+
+      - name: Derive immutable tag from the built commit
+        id: pin
+        run: echo "tag=prebuilt-${GITHUB_SHA:0:9}" >> "$GITHUB_OUTPUT"
+
+      # Debug-loop economy: a re-run must not rebuild an artifact that is already published
+      # and immutable (the runtime pins its sha256) — probe the release and no-op the job.
+      - name: Skip if this artifact is already published (immutable)
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pin.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "${{ matrix.asset }}"; then
+            echo "${{ matrix.asset }} already published for $TAG — skipping the build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure a stable Rust toolchain
+        if: steps.published.outputs.skip != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Build
+        if: steps.published.outputs.skip != 'true'
+        run: bash crates/rapier-c/scripts/${{ matrix.script }} out
+
+      - name: Upload build artifact (90-day convenience copy)
+        if: steps.published.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          retention-days: 90
+
+      - name: Publish to release (permanent)
+        if: steps.published.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pin.outputs.tag }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "librapier_c prebuilt ($TAG)" \
+              --notes "Prebuilt librapier_c (C ABI over native rapier3d 0.34.0, f32) at commit ${GITHUB_SHA}. Release config only. Produced by build-rapier-c.yml for threejs-native-runtime Phase 19."
+          # Pinned artifacts are IMMUTABLE: the runtime pins this asset's sha256 in its lock,
+          # so a re-upload (new bytes) would break every clone that fetched the pin. First
+          # publish wins; delete the asset by hand only to deliberately republish (then re-pin).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx "${{ matrix.asset }}"; then
+            echo "${{ matrix.asset }} already published for $TAG — keeping the pinned bytes, skipping upload"
+          else
+            gh release upload "$TAG" "out/${{ matrix.asset }}" --repo "$GITHUB_REPOSITORY"
+          fi

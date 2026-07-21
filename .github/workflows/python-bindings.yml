@@ -1,10 +1,11 @@
 name: Python bindings
 
+# elix22 fork: upstream Rapier's stock CI is DISABLED (workflow_dispatch only) so it never
+# burns Actions minutes on pushes to this fork. The fork exists to build librapier_c for
+# threejs-native-runtime (.github/workflows/build-rapier-c.yml), not to re-run Rapier's own
+# test matrix. Re-enable a push/pull_request trigger only to deliberately run upstream CI.
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
