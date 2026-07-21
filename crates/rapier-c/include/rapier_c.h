@@ -59,12 +59,19 @@ typedef enum {
     RPR_BODY_KINEMATIC_POSITION  = 2
 } RprBodyType;
 
-/* Collider shapes — mirrors RAPIER.ColliderDesc.{ball,cuboid,capsule,trimesh}. */
+/* Collider shapes. cylinder/cone reuse the capsule half-height+radius fields; round_cuboid
+ * reuses cuboid_half plus border_radius; convex_hull reuses trimesh_vertices (points, no
+ * indices). Mirrors RAPIER.ColliderDesc.{ball,cuboid,capsule,trimesh,cylinder,cone,roundCuboid,
+ * convexHull}. */
 typedef enum {
-    RPR_SHAPE_BALL    = 0,
-    RPR_SHAPE_CUBOID  = 1,
-    RPR_SHAPE_CAPSULE = 2,
-    RPR_SHAPE_TRIMESH = 3
+    RPR_SHAPE_BALL         = 0,
+    RPR_SHAPE_CUBOID       = 1,
+    RPR_SHAPE_CAPSULE      = 2,
+    RPR_SHAPE_TRIMESH      = 3,
+    RPR_SHAPE_CYLINDER     = 4,
+    RPR_SHAPE_CONE         = 5,
+    RPR_SHAPE_ROUND_CUBOID = 6,
+    RPR_SHAPE_CONVEX_HULL  = 7
 } RprShapeType;
 
 /*
@@ -97,8 +104,9 @@ typedef struct {
 
     float   ball_radius;            /* BALL */
     float   cuboid_half[3];         /* CUBOID: hx, hy, hz */
-    float   capsule_half_height;    /* CAPSULE (segment half-height, +Y axis) */
-    float   capsule_radius;         /* CAPSULE */
+    float   capsule_half_height;    /* CAPSULE / CYLINDER / CONE (segment half-height, +Y axis) */
+    float   capsule_radius;         /* CAPSULE / CYLINDER / CONE */
+    float   border_radius;          /* ROUND_CUBOID border radius */
 
     const float*    trimesh_vertices;   /* TRIMESH */
     uint32_t        trimesh_vertex_count;
@@ -110,6 +118,10 @@ typedef struct {
     float   restitution;     int32_t has_restitution;
     float   translation[3];  int32_t has_translation;   /* collider-local offset */
     uint32_t collision_groups; int32_t has_collision_groups; /* packed membership<<16|filter */
+    int32_t sensor;          int32_t has_sensor;        /* ColliderDesc.setSensor */
+    uint32_t active_events;  int32_t has_active_events; /* ActiveEvents bits: 1 COLLISION, 2 CONTACT_FORCE */
+    float   contact_force_threshold; int32_t has_contact_force_threshold;
+    float   mass;            int32_t has_mass;          /* ColliderDesc.setMass (overrides density) */
 } RprColliderDesc;
 
 /* ---- world lifecycle ------------------------------------------------------------- */
@@ -118,9 +130,27 @@ RprWorld* rpr_world_create(const float gravity[3]);
 void      rpr_world_free(RprWorld* w);
 /* The integration timestep the solver will use (IntegrationParameters::dt, default 1/60). */
 float     rpr_world_timestep(const RprWorld* w);
+void      rpr_world_set_timestep(RprWorld* w, float dt);
+void      rpr_world_gravity(const RprWorld* w, float out[3]);
+void      rpr_world_set_gravity(RprWorld* w, const float v[3]);
 void      rpr_world_step(RprWorld* w);
 /* rapier3d crate version, e.g. "0.34.0" — static storage, do not free. */
 const char* rpr_version(void);
+
+/* ---- collision & contact-force events (compat EventQueue + world.step(events)) ----
+ * The world owns one std::mpsc channel pair. rpr_world_step_events steps WITH a collector,
+ * then drains this step's events into internal buffers (autoDrain=true semantics: each step
+ * replaces the previous step's events). The C side reads them back with the count + indexed
+ * getters below and hands them to the JS drain callbacks. A collider only produces events if
+ * it was given ActiveEvents (COLLISION_EVENTS / CONTACT_FORCE_EVENTS) via its ColliderDesc or
+ * rpr_collider_set_active_events. */
+void     rpr_world_step_events(RprWorld* w);
+uint32_t rpr_world_num_collision_events(const RprWorld* w);
+/* out_handles gets [collider1, collider2]; *out_started is 1 for Started, 0 for Stopped. */
+void     rpr_world_collision_event(const RprWorld* w, uint32_t i, uint64_t out_handles[2], int32_t* out_started);
+uint32_t rpr_world_num_contact_force_events(const RprWorld* w);
+/* out_handles gets [collider1, collider2]; out5 gets [total_force_mag, max_force_mag, dir.x, dir.y, dir.z]. */
+void     rpr_world_contact_force_event(const RprWorld* w, uint32_t i, uint64_t out_handles[2], float out5[5]);
 
 /* ---- rigid bodies ---------------------------------------------------------------- */
 
@@ -130,13 +160,46 @@ void     rpr_world_remove_rigid_body(RprWorld* w, uint64_t body);
 void rpr_body_translation(const RprWorld* w, uint64_t body, float out[3]);
 void rpr_body_rotation(const RprWorld* w, uint64_t body, float out[4]);      /* x,y,z,w */
 void rpr_body_linvel(const RprWorld* w, uint64_t body, float out[3]);
+void rpr_body_angvel(const RprWorld* w, uint64_t body, float out[3]);
 void rpr_body_set_translation(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
 void rpr_body_set_rotation(RprWorld* w, uint64_t body, const float q[4], int32_t wake);
 void rpr_body_set_linvel(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
 void rpr_body_set_angvel(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
 /* Kinematic-position bodies: the pose to interpolate to on the next step (compat
- * setNextKinematicTranslation). */
+ * setNextKinematicTranslation / setNextKinematicRotation). */
 void rpr_body_set_next_kinematic_translation(RprWorld* w, uint64_t body, const float v[3]);
+void rpr_body_set_next_kinematic_rotation(RprWorld* w, uint64_t body, const float q[4]);
+
+/* Forces & impulses (dynamic bodies). `wake` wakes the body if it was sleeping. */
+void rpr_body_apply_impulse(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
+void rpr_body_apply_impulse_at_point(RprWorld* w, uint64_t body, const float imp[3], const float point[3], int32_t wake);
+void rpr_body_add_force(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
+void rpr_body_add_force_at_point(RprWorld* w, uint64_t body, const float f[3], const float point[3], int32_t wake);
+void rpr_body_apply_torque_impulse(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
+void rpr_body_add_torque(RprWorld* w, uint64_t body, const float v[3], int32_t wake);
+void rpr_body_reset_forces(RprWorld* w, uint64_t body, int32_t wake);
+void rpr_body_reset_torques(RprWorld* w, uint64_t body, int32_t wake);
+
+/* Axis locks — pin a body's motion to a plane/axis (setEnabledTranslations/Rotations,
+ * lockTranslations/lockRotations). Essential for 2D (allow X,Y translation, Z rotation). */
+void rpr_body_set_enabled_translations(RprWorld* w, uint64_t body, int32_t x, int32_t y, int32_t z, int32_t wake);
+void rpr_body_set_enabled_rotations(RprWorld* w, uint64_t body, int32_t x, int32_t y, int32_t z, int32_t wake);
+void rpr_body_lock_translations(RprWorld* w, uint64_t body, int32_t locked, int32_t wake);
+void rpr_body_lock_rotations(RprWorld* w, uint64_t body, int32_t locked, int32_t wake);
+
+/* Body state. body_type: 0 dynamic, 1 fixed, 2 kinematic-position, 3 kinematic-velocity. */
+void    rpr_body_set_body_type(RprWorld* w, uint64_t body, int32_t body_type, int32_t wake);
+void    rpr_body_sleep(RprWorld* w, uint64_t body);
+void    rpr_body_wake_up(RprWorld* w, uint64_t body, int32_t strong);
+int32_t rpr_body_is_sleeping(const RprWorld* w, uint64_t body);
+void    rpr_body_set_enabled(RprWorld* w, uint64_t body, int32_t enabled);
+int32_t rpr_body_is_enabled(const RprWorld* w, uint64_t body);
+void    rpr_body_set_gravity_scale(RprWorld* w, uint64_t body, float scale, int32_t wake);
+float   rpr_body_mass(const RprWorld* w, uint64_t body);
+void    rpr_body_set_linear_damping(RprWorld* w, uint64_t body, float damping);
+void    rpr_body_set_angular_damping(RprWorld* w, uint64_t body, float damping);
+uint32_t rpr_body_num_colliders(const RprWorld* w, uint64_t body);
+uint64_t rpr_body_collider(const RprWorld* w, uint64_t body, uint32_t i);
 
 /* ---- colliders ------------------------------------------------------------------- */
 
@@ -144,6 +207,19 @@ void rpr_body_set_next_kinematic_translation(RprWorld* w, uint64_t body, const f
 uint64_t rpr_world_create_collider(RprWorld* w, const RprColliderDesc* d, uint64_t parent_body);
 void     rpr_world_remove_collider(RprWorld* w, uint64_t collider, int32_t wake);
 void     rpr_collider_set_collision_groups(RprWorld* w, uint64_t collider, uint32_t groups);
+/* Runtime material + event setters (compat Collider.setX). */
+void     rpr_collider_set_restitution(RprWorld* w, uint64_t collider, float v);
+void     rpr_collider_set_friction(RprWorld* w, uint64_t collider, float v);
+void     rpr_collider_set_density(RprWorld* w, uint64_t collider, float v);
+void     rpr_collider_set_mass(RprWorld* w, uint64_t collider, float v);
+void     rpr_collider_set_sensor(RprWorld* w, uint64_t collider, int32_t is_sensor);
+int32_t  rpr_collider_is_sensor(const RprWorld* w, uint64_t collider);
+void     rpr_collider_set_active_events(RprWorld* w, uint64_t collider, uint32_t bits);
+void     rpr_collider_set_contact_force_event_threshold(RprWorld* w, uint64_t collider, float threshold);
+void     rpr_collider_set_translation(RprWorld* w, uint64_t collider, const float v[3]);
+/* Read-back: which body owns this collider (RPR_INVALID if none), and its world translation. */
+uint64_t rpr_collider_parent(const RprWorld* w, uint64_t collider);
+void     rpr_collider_translation(const RprWorld* w, uint64_t collider, float out[3]);
 
 /* ---- ray cast -------------------------------------------------------------------- */
 
@@ -159,6 +235,49 @@ int32_t rpr_world_cast_ray(RprWorld* w,
                            uint32_t filter_groups, int32_t has_filter_groups,
                            uint64_t exclude_collider, int32_t has_exclude,
                            uint64_t* out_collider, float* out_toi);
+
+/* Like cast_ray but also returns the surface normal at the hit (compat castRayAndGetNormal). */
+int32_t rpr_world_cast_ray_and_get_normal(RprWorld* w,
+                           const float origin[3], const float dir[3],
+                           float max_toi, int32_t solid,
+                           uint32_t filter_groups, int32_t has_filter_groups,
+                           uint64_t exclude_collider, int32_t has_exclude,
+                           uint64_t* out_collider, float* out_toi, float out_normal[3]);
+
+/* Project a point onto the nearest collider (compat projectPoint). Returns 1 on a hit within
+ * max_dist (fills *out_collider, out_point[3], *out_inside), 0 otherwise. */
+int32_t rpr_world_project_point(RprWorld* w,
+                           const float point[3], float max_dist, int32_t solid,
+                           uint32_t filter_groups, int32_t has_filter_groups,
+                           uint64_t exclude_collider, int32_t has_exclude,
+                           uint64_t* out_collider, float out_point[3], int32_t* out_inside);
+
+/* ---- impulse joints (rapier3d::dynamics) -----------------------------------------
+ * A flat joint descriptor (compat JointData.<type> + createImpulseJoint). Motor/limit apply
+ * to the joint's canonical free axis (revolute: AngX, prismatic/spring/rope: LinX); the runtime
+ * config calls below take an explicit JointAxis (0 LinX,1 LinY,2 LinZ,3 AngX,4 AngY,5 AngZ). */
+typedef struct {
+    int32_t joint_type;      /* 0 revolute, 1 fixed, 2 prismatic, 3 spring, 4 rope, 5 spherical */
+    float   anchor1[3];      /* body-local anchor on body1 */
+    float   anchor2[3];      /* body-local anchor on body2 */
+    float   axis[3];         /* free axis for revolute/prismatic */
+    float   rest_length;     /* spring rest length / rope max length */
+    float   stiffness;       /* spring */
+    float   damping;         /* spring */
+    int32_t contacts_enabled;
+    int32_t has_limits;   float limit_min; float limit_max;
+    int32_t motor_kind;      /* 0 none, 1 position, 2 velocity */
+    float   motor_target;    /* target position (kind 1) or target velocity (kind 2) */
+    float   motor_stiffness; /* position motor stiffness */
+    float   motor_damping;   /* position motor damping, or velocity motor factor */
+} RprJointDesc;
+
+uint64_t rpr_world_create_impulse_joint(RprWorld* w, uint64_t body1, uint64_t body2, const RprJointDesc* d, int32_t wake);
+void     rpr_world_remove_impulse_joint(RprWorld* w, uint64_t joint, int32_t wake);
+/* Runtime reconfiguration (compat configureMotorPosition/Velocity + setLimits). */
+void     rpr_joint_configure_motor_position(RprWorld* w, uint64_t joint, int32_t axis, float target, float stiffness, float damping);
+void     rpr_joint_configure_motor_velocity(RprWorld* w, uint64_t joint, int32_t axis, float target_vel, float factor);
+void     rpr_joint_set_limits(RprWorld* w, uint64_t joint, int32_t axis, float min, float max);
 
 /* ---- raycast vehicle controller (rapier3d::control) ------------------------------ */
 

@@ -32,7 +32,14 @@ use rapier3d::control::{
     CharacterAutostep, CharacterLength, DynamicRayCastVehicleController,
     KinematicCharacterController, Wheel, WheelTuning,
 };
+use rapier3d::data::Index;
+use rapier3d::dynamics::{
+    FixedJointBuilder, GenericJoint, ImpulseJointHandle, JointAxis, PrismaticJointBuilder,
+    RevoluteJointBuilder, RopeJointBuilder, SphericalJointBuilder, SpringJointBuilder,
+};
+use rapier3d::pipeline::{ActiveEvents, ChannelEventCollector};
 use rapier3d::prelude::*;
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// Invalid / "none" handle. u64::MAX matches rapier's own `Handle::invalid()`
 /// (index=generation=0xFFFFFFFF). Crucially it is NOT 0: rapier's first handle is
@@ -51,11 +58,35 @@ struct CharState {
     grounded: bool,
 }
 
+/// One drained collision event (compat drainCollisionEvents(h1, h2, started)).
+struct CollEvt {
+    c1: u64,
+    c2: u64,
+    started: i32,
+}
+/// One drained contact-force event (compat drainContactForceEvents(event)).
+struct ForceEvt {
+    c1: u64,
+    c2: u64,
+    total_mag: f32,
+    max_mag: f32,
+    dir: [f32; 3],
+}
+
 /// Everything one compat `World` owns. Kept behind a `Box`; the C side sees `RprWorld*`.
 pub struct RprWorld {
     world: PhysicsWorld,
     vehicles: Vec<DynamicRayCastVehicleController>,
     characters: Vec<CharState>,
+    // Collision/contact-force events. The channel pair is created once; each
+    // rpr_world_step_events builds a fresh ChannelEventCollector from clones of the senders,
+    // steps, then drains the receivers into the pending vecs for the C side to read back.
+    coll_send: Sender<CollisionEvent>,
+    coll_recv: Receiver<CollisionEvent>,
+    force_send: Sender<ContactForceEvent>,
+    force_recv: Receiver<ContactForceEvent>,
+    pending_coll: Vec<CollEvt>,
+    pending_force: Vec<ForceEvt>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -79,6 +110,7 @@ pub struct RprColliderDesc {
     cuboid_half: [f32; 3],
     capsule_half_height: f32,
     capsule_radius: f32,
+    border_radius: f32,
     trimesh_vertices: *const f32,
     trimesh_vertex_count: u32,
     trimesh_indices: *const u32,
@@ -93,6 +125,33 @@ pub struct RprColliderDesc {
     has_translation: i32,
     collision_groups: u32,
     has_collision_groups: i32,
+    sensor: i32,
+    has_sensor: i32,
+    active_events: u32,
+    has_active_events: i32,
+    contact_force_threshold: f32,
+    has_contact_force_threshold: i32,
+    mass: f32,
+    has_mass: i32,
+}
+
+#[repr(C)]
+pub struct RprJointDesc {
+    joint_type: i32, // 0 revolute, 1 fixed, 2 prismatic, 3 spring, 4 rope, 5 spherical
+    anchor1: [f32; 3],
+    anchor2: [f32; 3],
+    axis: [f32; 3],
+    rest_length: f32,
+    stiffness: f32,
+    damping: f32,
+    contacts_enabled: i32,
+    has_limits: i32,
+    limit_min: f32,
+    limit_max: f32,
+    motor_kind: i32, // 0 none, 1 position, 2 velocity
+    motor_target: f32,
+    motor_stiffness: f32,
+    motor_damping: f32,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -116,6 +175,26 @@ fn co_to_u64(h: ColliderHandle) -> u64 {
 #[inline]
 fn co_from_u64(v: u64) -> ColliderHandle {
     ColliderHandle::from_raw_parts((v >> 32) as u32, v as u32)
+}
+#[inline]
+fn ij_to_u64(h: ImpulseJointHandle) -> u64 {
+    let (i, g) = h.0.into_raw_parts();
+    ((i as u64) << 32) | g as u64
+}
+#[inline]
+fn ij_from_u64(v: u64) -> ImpulseJointHandle {
+    ImpulseJointHandle(Index::from_raw_parts((v >> 32) as u32, v as u32))
+}
+#[inline]
+fn axis_from_i32(a: i32) -> JointAxis {
+    match a {
+        1 => JointAxis::LinY,
+        2 => JointAxis::LinZ,
+        3 => JointAxis::AngX,
+        4 => JointAxis::AngY,
+        5 => JointAxis::AngZ,
+        _ => JointAxis::LinX,
+    }
 }
 
 #[inline]
@@ -167,10 +246,18 @@ unsafe fn wheel_mut<'a>(w: *mut RprWorld, vc: u64, i: u32) -> Option<&'a mut Whe
 pub unsafe extern "C" fn rpr_world_create(gravity: *const f32) -> *mut RprWorld {
     let mut world = PhysicsWorld::new();
     world.gravity = rd3(gravity);
+    let (coll_send, coll_recv) = channel();
+    let (force_send, force_recv) = channel();
     Box::into_raw(Box::new(RprWorld {
         world,
         vehicles: Vec::new(),
         characters: Vec::new(),
+        coll_send,
+        coll_recv,
+        force_send,
+        force_recv,
+        pending_coll: Vec::new(),
+        pending_force: Vec::new(),
     }))
 }
 
@@ -188,9 +275,101 @@ pub unsafe extern "C" fn rpr_world_timestep(w: *const RprWorld) -> f32 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rpr_world_set_timestep(w: *mut RprWorld, dt: f32) {
+    let rw = &mut *w;
+    rw.world.integration_parameters.dt = dt;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_gravity(w: *const RprWorld, out: *mut f32) {
+    let rw = &*w;
+    wr3(out, rw.world.gravity);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_set_gravity(w: *mut RprWorld, v: *const f32) {
+    let rw = &mut *w;
+    rw.world.gravity = rd3(v);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rpr_world_step(w: *mut RprWorld) {
     let rw = &mut *w;
     rw.world.step();
+}
+
+// ---------------------------------------------------------------------------------------
+// Collision & contact-force events (compat EventQueue + world.step(eventQueue))
+// ---------------------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_step_events(w: *mut RprWorld) {
+    let rw = &mut *w;
+    rw.pending_coll.clear();
+    rw.pending_force.clear();
+    // Fresh collector from clones of the persistent senders — the receivers stay on the world.
+    let collector = ChannelEventCollector::new(rw.coll_send.clone(), rw.force_send.clone());
+    rw.world.step_with_events(&(), &collector);
+    while let Ok(ev) = rw.coll_recv.try_recv() {
+        let (c1, c2, started) = match ev {
+            CollisionEvent::Started(a, b, _) => (co_to_u64(a), co_to_u64(b), 1),
+            CollisionEvent::Stopped(a, b, _) => (co_to_u64(a), co_to_u64(b), 0),
+        };
+        rw.pending_coll.push(CollEvt { c1, c2, started });
+    }
+    while let Ok(ev) = rw.force_recv.try_recv() {
+        rw.pending_force.push(ForceEvt {
+            c1: co_to_u64(ev.collider1),
+            c2: co_to_u64(ev.collider2),
+            total_mag: ev.total_force_magnitude,
+            max_mag: ev.max_force_magnitude,
+            dir: [ev.max_force_direction.x, ev.max_force_direction.y, ev.max_force_direction.z],
+        });
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_num_collision_events(w: *const RprWorld) -> u32 {
+    (*w).pending_coll.len() as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_collision_event(
+    w: *const RprWorld,
+    i: u32,
+    out_handles: *mut u64,
+    out_started: *mut i32,
+) {
+    let rw = &*w;
+    if let Some(e) = rw.pending_coll.get(i as usize) {
+        *out_handles = e.c1;
+        *out_handles.add(1) = e.c2;
+        *out_started = e.started;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_num_contact_force_events(w: *const RprWorld) -> u32 {
+    (*w).pending_force.len() as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_contact_force_event(
+    w: *const RprWorld,
+    i: u32,
+    out_handles: *mut u64,
+    out5: *mut f32,
+) {
+    let rw = &*w;
+    if let Some(e) = rw.pending_force.get(i as usize) {
+        *out_handles = e.c1;
+        *out_handles.add(1) = e.c2;
+        *out5 = e.total_mag;
+        *out5.add(1) = e.max_mag;
+        *out5.add(2) = e.dir[0];
+        *out5.add(3) = e.dir[1];
+        *out5.add(4) = e.dir[2];
+    }
 }
 
 // rapier3d crate version pinned in Cargo.toml. Static, NUL-terminated.
@@ -212,6 +391,7 @@ pub unsafe extern "C" fn rpr_world_create_rigid_body(w: *mut RprWorld, d: *const
     let base = match d.body_type {
         1 => RigidBodyBuilder::fixed(),
         2 => RigidBodyBuilder::kinematic_position_based(),
+        3 => RigidBodyBuilder::kinematic_velocity_based(),
         _ => RigidBodyBuilder::dynamic(),
     };
     let t = Vector::new(d.translation[0], d.translation[1], d.translation[2]);
@@ -287,6 +467,190 @@ pub unsafe extern "C" fn rpr_body_set_angvel(w: *mut RprWorld, body: u64, v: *co
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_angvel(w: *const RprWorld, body: u64, out: *mut f32) {
+    let rw = &*w;
+    if let Some(b) = rw.world.bodies.get(rb_from_u64(body)) {
+        wr3(out, b.angvel());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_next_kinematic_rotation(w: *mut RprWorld, body: u64, q: *const f32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_next_kinematic_rotation(Rotation::from_xyzw(*q, *q.add(1), *q.add(2), *q.add(3)));
+    }
+}
+
+// ---- forces & impulses ----------------------------------------------------------------
+
+/// A tiny macro for the "borrow the body mut, call one method with (Vector, wake)" shape that
+/// every force/impulse entry point repeats.
+macro_rules! body_vec_wake {
+    ($name:ident, $method:ident) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(w: *mut RprWorld, body: u64, v: *const f32, wake: i32) {
+            let rw = &mut *w;
+            if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+                b.$method(rd3(v), wake != 0);
+            }
+        }
+    };
+}
+body_vec_wake!(rpr_body_apply_impulse, apply_impulse);
+body_vec_wake!(rpr_body_add_force, add_force);
+body_vec_wake!(rpr_body_apply_torque_impulse, apply_torque_impulse);
+body_vec_wake!(rpr_body_add_torque, add_torque);
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_apply_impulse_at_point(w: *mut RprWorld, body: u64, imp: *const f32, point: *const f32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.apply_impulse_at_point(rd3(imp), rd3(point), wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_add_force_at_point(w: *mut RprWorld, body: u64, f: *const f32, point: *const f32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.add_force_at_point(rd3(f), rd3(point), wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_reset_forces(w: *mut RprWorld, body: u64, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.reset_forces(wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_reset_torques(w: *mut RprWorld, body: u64, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.reset_torques(wake != 0);
+    }
+}
+
+// ---- axis locks -----------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_enabled_translations(w: *mut RprWorld, body: u64, x: i32, y: i32, z: i32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_enabled_translations(x != 0, y != 0, z != 0, wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_enabled_rotations(w: *mut RprWorld, body: u64, x: i32, y: i32, z: i32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_enabled_rotations(x != 0, y != 0, z != 0, wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_lock_translations(w: *mut RprWorld, body: u64, locked: i32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.lock_translations(locked != 0, wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_lock_rotations(w: *mut RprWorld, body: u64, locked: i32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.lock_rotations(locked != 0, wake != 0);
+    }
+}
+
+// ---- body state -----------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_body_type(w: *mut RprWorld, body: u64, body_type: i32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        let t = match body_type {
+            1 => RigidBodyType::Fixed,
+            2 => RigidBodyType::KinematicPositionBased,
+            3 => RigidBodyType::KinematicVelocityBased,
+            _ => RigidBodyType::Dynamic,
+        };
+        b.set_body_type(t, wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_sleep(w: *mut RprWorld, body: u64) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.sleep();
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_wake_up(w: *mut RprWorld, body: u64, strong: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.wake_up(strong != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_is_sleeping(w: *const RprWorld, body: u64) -> i32 {
+    let rw = &*w;
+    rw.world.bodies.get(rb_from_u64(body)).map(|b| b.is_sleeping() as i32).unwrap_or(0)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_enabled(w: *mut RprWorld, body: u64, enabled: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_enabled(enabled != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_is_enabled(w: *const RprWorld, body: u64) -> i32 {
+    let rw = &*w;
+    rw.world.bodies.get(rb_from_u64(body)).map(|b| b.is_enabled() as i32).unwrap_or(0)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_gravity_scale(w: *mut RprWorld, body: u64, scale: f32, wake: i32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_gravity_scale(scale, wake != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_mass(w: *const RprWorld, body: u64) -> f32 {
+    let rw = &*w;
+    rw.world.bodies.get(rb_from_u64(body)).map(|b| b.mass()).unwrap_or(0.0)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_linear_damping(w: *mut RprWorld, body: u64, damping: f32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_linear_damping(damping);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_set_angular_damping(w: *mut RprWorld, body: u64, damping: f32) {
+    let rw = &mut *w;
+    if let Some(b) = rw.world.bodies.get_mut(rb_from_u64(body)) {
+        b.set_angular_damping(damping);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_num_colliders(w: *const RprWorld, body: u64) -> u32 {
+    let rw = &*w;
+    rw.world.bodies.get(rb_from_u64(body)).map(|b| b.colliders().len() as u32).unwrap_or(0)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_body_collider(w: *const RprWorld, body: u64, i: u32) -> u64 {
+    let rw = &*w;
+    rw.world
+        .bodies
+        .get(rb_from_u64(body))
+        .and_then(|b| b.colliders().get(i as usize).copied())
+        .map(co_to_u64)
+        .unwrap_or(RPR_INVALID)
+}
+
 // ---------------------------------------------------------------------------------------
 // Colliders
 // ---------------------------------------------------------------------------------------
@@ -321,6 +685,27 @@ pub unsafe extern "C" fn rpr_world_create_collider(
                 ColliderBuilder::trimesh(verts, tris).ok()
             }
         }
+        4 => Some(ColliderBuilder::cylinder(d.capsule_half_height, d.capsule_radius)),
+        5 => Some(ColliderBuilder::cone(d.capsule_half_height, d.capsule_radius)),
+        6 => Some(ColliderBuilder::round_cuboid(
+            d.cuboid_half[0],
+            d.cuboid_half[1],
+            d.cuboid_half[2],
+            d.border_radius,
+        )),
+        7 => {
+            // Convex hull of a point cloud (trimesh_vertices reused; indices ignored).
+            if d.trimesh_vertices.is_null() {
+                None
+            } else {
+                let vcount = d.trimesh_vertex_count as usize;
+                let vslice = std::slice::from_raw_parts(d.trimesh_vertices, vcount * 3);
+                let pts: Vec<Vector> = (0..vcount)
+                    .map(|k| Vector::new(vslice[k * 3], vslice[k * 3 + 1], vslice[k * 3 + 2]))
+                    .collect();
+                ColliderBuilder::convex_hull(&pts)
+            }
+        }
         _ => None,
     };
     let mut b = match base {
@@ -341,6 +726,18 @@ pub unsafe extern "C" fn rpr_world_create_collider(
     }
     if d.has_collision_groups != 0 {
         b = b.collision_groups(unpack_groups(d.collision_groups));
+    }
+    if d.has_sensor != 0 {
+        b = b.sensor(d.sensor != 0);
+    }
+    if d.has_active_events != 0 {
+        b = b.active_events(ActiveEvents::from_bits_truncate(d.active_events));
+    }
+    if d.has_contact_force_threshold != 0 {
+        b = b.contact_force_event_threshold(d.contact_force_threshold);
+    }
+    if d.has_mass != 0 {
+        b = b.mass(d.mass);
     }
     let parent_opt = if parent == RPR_INVALID { None } else { Some(rb_from_u64(parent)) };
     co_to_u64(rw.world.insert_collider(b, parent_opt))
@@ -364,6 +761,68 @@ pub unsafe extern "C" fn rpr_collider_set_collision_groups(w: *mut RprWorld, col
     let rw = &mut *w;
     if let Some(c) = rw.world.colliders.get_mut(co_from_u64(collider)) {
         c.set_collision_groups(unpack_groups(groups));
+    }
+}
+
+/// The "borrow the collider mut, call a one-f32 setter" shape shared by the material setters.
+macro_rules! collider_set_f32 {
+    ($name:ident, $method:ident) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(w: *mut RprWorld, collider: u64, v: f32) {
+            let rw = &mut *w;
+            if let Some(c) = rw.world.colliders.get_mut(co_from_u64(collider)) {
+                c.$method(v);
+            }
+        }
+    };
+}
+collider_set_f32!(rpr_collider_set_restitution, set_restitution);
+collider_set_f32!(rpr_collider_set_friction, set_friction);
+collider_set_f32!(rpr_collider_set_density, set_density);
+collider_set_f32!(rpr_collider_set_mass, set_mass);
+collider_set_f32!(rpr_collider_set_contact_force_event_threshold, set_contact_force_event_threshold);
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_set_sensor(w: *mut RprWorld, collider: u64, is_sensor: i32) {
+    let rw = &mut *w;
+    if let Some(c) = rw.world.colliders.get_mut(co_from_u64(collider)) {
+        c.set_sensor(is_sensor != 0);
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_is_sensor(w: *const RprWorld, collider: u64) -> i32 {
+    let rw = &*w;
+    rw.world.colliders.get(co_from_u64(collider)).map(|c| c.is_sensor() as i32).unwrap_or(0)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_set_active_events(w: *mut RprWorld, collider: u64, bits: u32) {
+    let rw = &mut *w;
+    if let Some(c) = rw.world.colliders.get_mut(co_from_u64(collider)) {
+        c.set_active_events(ActiveEvents::from_bits_truncate(bits));
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_set_translation(w: *mut RprWorld, collider: u64, v: *const f32) {
+    let rw = &mut *w;
+    if let Some(c) = rw.world.colliders.get_mut(co_from_u64(collider)) {
+        c.set_translation(rd3(v));
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_parent(w: *const RprWorld, collider: u64) -> u64 {
+    let rw = &*w;
+    rw.world
+        .colliders
+        .get(co_from_u64(collider))
+        .and_then(|c| c.parent())
+        .map(rb_to_u64)
+        .unwrap_or(RPR_INVALID)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rpr_collider_translation(w: *const RprWorld, collider: u64, out: *mut f32) {
+    let rw = &*w;
+    if let Some(c) = rw.world.colliders.get(co_from_u64(collider)) {
+        wr3(out, c.translation());
     }
 }
 
@@ -405,6 +864,176 @@ pub unsafe extern "C" fn rpr_world_cast_ray(
             1
         }
         None => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_cast_ray_and_get_normal(
+    w: *mut RprWorld,
+    origin: *const f32,
+    dir: *const f32,
+    max_toi: f32,
+    solid: i32,
+    filter_groups: u32,
+    has_filter_groups: i32,
+    exclude_collider: u64,
+    has_exclude: i32,
+    out_collider: *mut u64,
+    out_toi: *mut f32,
+    out_normal: *mut f32,
+) -> i32 {
+    let rw = &*w;
+    let mut filter = QueryFilter::default();
+    if has_filter_groups != 0 {
+        filter = filter.groups(unpack_groups(filter_groups));
+    }
+    if has_exclude != 0 {
+        filter = filter.exclude_collider(co_from_u64(exclude_collider));
+    }
+    let ray = Ray::new(rd3(origin), rd3(dir));
+    match rw.world.cast_ray_and_get_normal(&ray, max_toi, solid != 0, filter) {
+        Some((h, hit)) => {
+            if !out_collider.is_null() {
+                *out_collider = co_to_u64(h);
+            }
+            if !out_toi.is_null() {
+                *out_toi = hit.time_of_impact;
+            }
+            if !out_normal.is_null() {
+                wr3(out_normal, hit.normal);
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_project_point(
+    w: *mut RprWorld,
+    point: *const f32,
+    max_dist: f32,
+    solid: i32,
+    filter_groups: u32,
+    has_filter_groups: i32,
+    exclude_collider: u64,
+    has_exclude: i32,
+    out_collider: *mut u64,
+    out_point: *mut f32,
+    out_inside: *mut i32,
+) -> i32 {
+    let rw = &*w;
+    let mut filter = QueryFilter::default();
+    if has_filter_groups != 0 {
+        filter = filter.groups(unpack_groups(filter_groups));
+    }
+    if has_exclude != 0 {
+        filter = filter.exclude_collider(co_from_u64(exclude_collider));
+    }
+    match rw.world.project_point(rd3(point), max_dist, solid != 0, filter) {
+        Some((h, proj)) => {
+            if !out_collider.is_null() {
+                *out_collider = co_to_u64(h);
+            }
+            if !out_point.is_null() {
+                wr3(out_point, proj.point);
+            }
+            if !out_inside.is_null() {
+                *out_inside = proj.is_inside as i32;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Impulse joints
+// ---------------------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_create_impulse_joint(
+    w: *mut RprWorld,
+    body1: u64,
+    body2: u64,
+    d: *const RprJointDesc,
+    _wake: i32,
+) -> u64 {
+    let rw = &mut *w;
+    let d = &*d;
+    let axis = Vector::new(d.axis[0], d.axis[1], d.axis[2]);
+    // Each typed builder Into<GenericJoint>; anchors/limits/motor are then set on the generic form.
+    let mut j: GenericJoint = match d.joint_type {
+        0 => RevoluteJointBuilder::new(axis).into(),
+        2 => PrismaticJointBuilder::new(axis).into(),
+        3 => SpringJointBuilder::new(d.rest_length, d.stiffness, d.damping).into(),
+        4 => RopeJointBuilder::new(d.rest_length).into(),
+        5 => SphericalJointBuilder::new().into(),
+        _ => FixedJointBuilder::new().into(),
+    };
+    j.set_local_anchor1(Vector::new(d.anchor1[0], d.anchor1[1], d.anchor1[2]));
+    j.set_local_anchor2(Vector::new(d.anchor2[0], d.anchor2[1], d.anchor2[2]));
+    if d.contacts_enabled != 0 {
+        j.set_contacts_enabled(true);
+    }
+    // The joint's canonical free axis: rotation about local X for a revolute, translation along
+    // local X for prismatic/spring/rope. Limits + a desc-time motor apply to that axis.
+    let free = if d.joint_type == 0 { JointAxis::AngX } else { JointAxis::LinX };
+    if d.has_limits != 0 {
+        j.set_limits(free, [d.limit_min, d.limit_max]);
+    }
+    match d.motor_kind {
+        1 => {
+            j.set_motor_position(free, d.motor_target, d.motor_stiffness, d.motor_damping);
+        }
+        2 => {
+            j.set_motor_velocity(free, d.motor_target, d.motor_damping);
+        }
+        _ => {}
+    }
+    ij_to_u64(rw.world.insert_impulse_joint(rb_from_u64(body1), rb_from_u64(body2), j))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_world_remove_impulse_joint(w: *mut RprWorld, joint: u64, _wake: i32) {
+    let rw = &mut *w;
+    rw.world.remove_impulse_joint(ij_from_u64(joint));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_joint_configure_motor_position(
+    w: *mut RprWorld,
+    joint: u64,
+    axis: i32,
+    target: f32,
+    stiffness: f32,
+    damping: f32,
+) {
+    let rw = &mut *w;
+    if let Some(j) = rw.world.impulse_joints.get_mut(ij_from_u64(joint), true) {
+        j.data.set_motor_position(axis_from_i32(axis), target, stiffness, damping);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_joint_configure_motor_velocity(
+    w: *mut RprWorld,
+    joint: u64,
+    axis: i32,
+    target_vel: f32,
+    factor: f32,
+) {
+    let rw = &mut *w;
+    if let Some(j) = rw.world.impulse_joints.get_mut(ij_from_u64(joint), true) {
+        j.data.set_motor_velocity(axis_from_i32(axis), target_vel, factor);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rpr_joint_set_limits(w: *mut RprWorld, joint: u64, axis: i32, min: f32, max: f32) {
+    let rw = &mut *w;
+    if let Some(j) = rw.world.impulse_joints.get_mut(ij_from_u64(joint), true) {
+        j.data.set_limits(axis_from_i32(axis), [min, max]);
     }
 }
 
