@@ -502,7 +502,15 @@ pub unsafe extern "C" fn rpr_vehicle_update(
     // Split-borrow: the controller vec and the physics world are distinct fields.
     let RprWorld { world, vehicles, .. } = &mut *w;
     if let Some(v) = vehicles.get_mut(idx) {
-        let mut filter = QueryFilter::default();
+        // The wheel rays MUST exclude the chassis body: they start at the suspension hard points,
+        // which sit INSIDE the chassis collider, so without this exclusion every ray hits the
+        // chassis itself at toi=0 — a permanent fake "contact" that travels with the car. The
+        // fingerprint is unmistakable once seen: wheels always in contact (even mid-air),
+        // suspension pinned at its minimum length, near-zero real tyre forces. rapier 0.34 moved
+        // the filter from update_vehicle's own internals to the caller-built QueryPipeline, so
+        // the exclusion is OUR job here (same lesson as the character controller's
+        // exclude_collider in rpr_character_move).
+        let mut filter = QueryFilter::default().exclude_rigid_body(v.chassis);
         if has_filter_groups != 0 {
             filter = filter.groups(unpack_groups(filter_groups));
         }
